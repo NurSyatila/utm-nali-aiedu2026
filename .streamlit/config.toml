@@ -1,0 +1,4 @@
+[server]
+# Lets AiEDU serve the summary image at its own address,
+# so it can be opened in a new tab.
+enableStaticServing = true
