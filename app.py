@@ -1,5 +1,6 @@
 import io
 import re
+from datetime import date
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -322,6 +323,196 @@ def build_feedback(item_results: pd.DataFrame, mean_gain: float) -> List[str]:
     return messages
 
 
+SUMMARY_COLORS = {
+    "before": "#A3AEBD",
+    "after": "#2563A8",
+    "up": "#2E8B57",
+    "down": "#C2412D",
+    "flat": "#8A94A3",
+    "ink": "#1B2430",
+    "muted": "#5B6675",
+    "tile": "#F2F5F9",
+    "Low gain": "#E8A33D",
+    "Medium gain": "#5B9BD5",
+    "High gain": "#2E8B57",
+    CEILING: "#9A8CC2",
+}
+
+
+def build_summary_png(
+    item_results: pd.DataFrame,
+    student_results: pd.DataFrame,
+    mean_before: float,
+    mean_after: float,
+    mean_gain: float,
+    positive_change: float,
+    use_confidence: bool,
+    feedback: List[str],
+    subtitle: str,
+) -> bytes:
+    """Draw a one-page summary of the whole analysis and return it as PNG bytes.
+
+    Shows class-level numbers only (no student names), so it can be shared safely.
+    """
+    import textwrap
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+
+    c = SUMMARY_COLORS
+    plt.rcParams.update({"font.size": 11, "axes.edgecolor": "#C9D1DB", "axes.labelcolor": c["muted"],
+                         "xtick.color": c["muted"], "ytick.color": c["ink"]})
+    fig = plt.figure(figsize=(16, 10.5), dpi=110, facecolor="white")
+    outer = fig.add_gridspec(
+        2, 3, hspace=0.62, wspace=0.42,
+        left=0.17, right=0.97, top=0.70, bottom=0.11,
+    )
+    kpi = fig.add_gridspec(1, 4, wspace=0.06, left=0.03, right=0.97, top=0.88, bottom=0.775)
+
+    fig.text(0.03, 0.955, "AiEDU learning summary", fontsize=24, weight="bold", color=c["ink"])
+    fig.text(0.03, 0.915, subtitle, fontsize=12.5, color=c["muted"])
+
+    # --- KPI tiles -------------------------------------------------------
+    n = len(student_results)
+    ceiling_n = int(student_results["Normalised gain (g)"].isna().sum())
+    tiles = [
+        ("Class mean score", f"{mean_before:.0f}% → {mean_after:.0f}%", f"{mean_after - mean_before:+.0f} percentage points"),
+        ("Mean normalised gain", "n/a" if pd.isna(mean_gain) else f"{mean_gain:.2f}",
+         gain_category(mean_gain).lower() if not pd.isna(mean_gain) else "all students at ceiling"),
+        ("Students who improved", f"{positive_change:.0f}%", f"of {n} matched students"),
+    ]
+    if use_confidence:
+        ce_before = int(student_results["Confident errors before"].sum())
+        ce_after = int(student_results["Confident errors after"].sum())
+        tiles.append(("Confident misconceptions", f"{ce_before} → {ce_after}", "answers students were sure of, but wrong"))
+    else:
+        tiles.append(("At ceiling", f"{ceiling_n}", "full marks before the lesson"))
+
+    for i, (label, value, note) in enumerate(tiles):
+        ax = fig.add_subplot(kpi[0, i])
+        ax.set_axis_off()
+        ax.add_patch(FancyBboxPatch((0, 0), 1, 1, boxstyle="round,pad=0,rounding_size=0.06",
+                                    transform=ax.transAxes, facecolor=c["tile"], edgecolor="none"))
+        ax.text(0.06, 0.78, label.upper(), transform=ax.transAxes, fontsize=10, color=c["muted"], weight="bold")
+        ax.text(0.06, 0.38, value, transform=ax.transAxes, fontsize=24, color=c["ink"], weight="bold")
+        ax.text(0.06, 0.12, note, transform=ax.transAxes, fontsize=10, color=c["muted"])
+
+    topics = ["\n".join(textwrap.wrap(str(t), 26)) for t in item_results["Topic"]]
+    y = np.arange(len(topics))
+
+    # --- Understanding by topic -------------------------------------------
+    ax1 = fig.add_subplot(outer[0, :2])
+    h = 0.38
+    ax1.barh(y - h / 2, item_results["Before correct (%)"], height=h, color=c["before"], label="Before")
+    ax1.barh(y + h / 2, item_results["Post correct (%)"], height=h, color=c["after"], label="After")
+    for yi, value in zip(y + h / 2, item_results["Post correct (%)"]):
+        ax1.text(min(value + 1.5, 101), yi, f"{value:.0f}%", va="center", fontsize=10, color=c["ink"])
+    ax1.set_yticks(y, topics)
+    ax1.invert_yaxis()
+    ax1.set_xlim(0, 110)
+    ax1.set_xticks([0, 20, 40, 60, 80, 100])
+    ax1.set_xlabel("Students answering correctly (%)")
+    ax1.set_title("Understanding by topic", loc="left", fontsize=14, weight="bold", color=c["ink"])
+    ax1.legend(loc="lower right", bbox_to_anchor=(1, 1.0), frameon=False, ncol=2)
+    ax1.grid(axis="x", color="#E3E8EE", linewidth=0.8)
+    ax1.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax1.spines[side].set_visible(False)
+
+    # --- Gain categories ------------------------------------------------
+    ax2 = fig.add_subplot(outer[0, 2])
+    order = ["High gain", "Medium gain", "Low gain", CEILING]
+    counts = student_results["Gain category"].value_counts().reindex(order, fill_value=0)
+    counts = counts[counts > 0]
+    if counts.sum():
+        wedges, _ = ax2.pie(counts.values, colors=[c[k] for k in counts.index], startangle=90,
+                            counterclock=False, wedgeprops=dict(width=0.38, edgecolor="white"))
+        ax2.text(0, 0, f"{n}\nstudents", ha="center", va="center", fontsize=13, weight="bold", color=c["ink"])
+        ax2.legend(wedges, [f"{k}: {v}" for k, v in counts.items()], loc="upper center",
+                   bbox_to_anchor=(0.5, -0.02), frameon=False, ncol=2, fontsize=10)
+    ax2.set_title("Learning-gain groups", loc="left", fontsize=14, weight="bold", color=c["ink"])
+    ax2.set_aspect("equal")
+
+    # --- Change by topic, or confident misconceptions -----------------------
+    ax3 = fig.add_subplot(outer[1, :2])
+    if use_confidence:
+        ax3.barh(y - h / 2, item_results["Confident errors before (%)"], height=h, color=c["before"], label="Before")
+        ax3.barh(y + h / 2, item_results["Confident errors after (%)"], height=h, color=c["down"], label="After")
+        top = max(10.0, float(item_results[["Confident errors before (%)", "Confident errors after (%)"]].max().max()))
+        ax3.set_xlim(0, min(100, top * 1.2))
+        ax3.set_xlabel("Students sure of a wrong answer (%)")
+        ax3.set_title("Confident misconceptions by topic", loc="left", fontsize=14, weight="bold", color=c["ink"])
+        ax3.legend(loc="lower right", bbox_to_anchor=(1, 1.0), frameon=False, ncol=2)
+    else:
+        change = item_results["Improvement (pp)"]
+        colors = [c["up"] if v > 0 else c["down"] if v < 0 else c["flat"] for v in change]
+        ax3.barh(y, change, height=0.55, color=colors)
+        span = max(5.0, float(change.abs().max())) * 1.25
+        ax3.set_xlim(-span, span)
+        ax3.axvline(0, color=c["ink"], linewidth=1)
+        for yi, value in zip(y, change):
+            ax3.text(value + (span * 0.02 if value >= 0 else -span * 0.02), yi, f"{value:+.0f}",
+                     va="center", ha="left" if value >= 0 else "right", fontsize=10, color=c["ink"])
+        ax3.set_xlabel("Change in students answering correctly (percentage points)")
+        ax3.set_title("Change by topic", loc="left", fontsize=14, weight="bold", color=c["ink"])
+    ax3.set_yticks(y, topics)
+    ax3.invert_yaxis()
+    ax3.grid(axis="x", color="#E3E8EE", linewidth=0.8)
+    ax3.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax3.spines[side].set_visible(False)
+
+    # --- Key messages ----------------------------------------------------
+    ax4 = fig.add_subplot(outer[1, 2])
+    ax4.set_axis_off()
+    ax4.set_title("Key messages", loc="left", fontsize=14, weight="bold", color=c["ink"])
+    lines = []
+    for message in feedback[:4]:
+        wrapped = textwrap.wrap(message, 40)
+        if len(wrapped) > 4:
+            wrapped = wrapped[:4]
+            wrapped[-1] = wrapped[-1].rstrip(".,; ") + "…"
+        lines.append("• " + "\n   ".join(wrapped))
+    ax4.text(0, 1, "\n\n".join(lines), va="top", ha="left", fontsize=10.5, color=c["ink"],
+             transform=ax4.transAxes, linespacing=1.35)
+
+    fig.text(0.03, 0.015, "Normalised gain g = (after − before) ÷ (maximum − before). "
+             "Students with full marks before are 'At ceiling' and excluded from the mean gain.",
+             fontsize=9, color=c["muted"])
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", facecolor="white")
+    plt.close(fig)
+    return buffer.getvalue()
+
+
+def publish_static_image(png: bytes) -> Optional[str]:
+    """Save the image where Streamlit can serve it, and return its URL path.
+
+    Needs `enableStaticServing = true` in .streamlit/config.toml. The file name is
+    a hash of the image, so each class's summary gets its own unguessable address.
+    Returns None when static serving is off or the folder cannot be written.
+    """
+    import hashlib
+    from pathlib import Path
+
+    try:
+        if not st.get_option("server.enableStaticServing"):
+            return None
+        folder = Path(__file__).resolve().parent / "static"
+        folder.mkdir(exist_ok=True)
+        name = f"summary_{hashlib.sha256(png).hexdigest()[:20]}.png"
+        path = folder / name
+        if not path.exists():
+            path.write_bytes(png)
+        return f"app/static/{name}"
+    except Exception:
+        return None
+
+
 def dataframe_to_excel_bytes(
     student_results: pd.DataFrame, item_results: pd.DataFrame
 ) -> bytes:
@@ -342,6 +533,9 @@ st.write(
     "Load responses collected before and after a lesson. "
     "The app matches students, scores each item, calculates learning gain, and generates feedback."
 )
+
+# Filled in after the analysis runs, so the one-page summary appears at the top.
+summary_slot = st.container()
 
 preset_label = st.selectbox(
     "Activity preset",
@@ -722,8 +916,11 @@ if missing_answer:
     st.warning("Define a correct answer for every selected question.")
     st.stop()
 
-analyze = st.button("Analyze learning improvement", type="primary")
-if not analyze:
+# Keep results on screen after the first click, so downloads and other
+# interactions (which rerun the script) do not hide them again.
+if st.button("Analyze learning improvement", type="primary"):
+    st.session_state["analyzed"] = True
+if not st.session_state.get("analyzed"):
     st.stop()
 
 # -----------------------------
@@ -872,6 +1069,46 @@ metric3.metric(
 metric4.metric("Students who improved", f"{positive_change:.1f}%")
 
 feedback = build_feedback(item_results, mean_gain)
+
+# ---------------------------------------------------------
+# One-page summary at the top of the page
+# ---------------------------------------------------------
+summary_subtitle = (
+    f"{preset['label'] if preset else 'Pre–post assessment'}  ·  "
+    f"{len(student_results)} matched students  ·  {date.today():%d %B %Y}"
+)
+summary_png = build_summary_png(
+    item_results,
+    student_results,
+    mean_before,
+    mean_after,
+    mean_gain,
+    positive_change,
+    use_confidence,
+    feedback,
+    summary_subtitle,
+)
+summary_url = publish_static_image(summary_png)
+with summary_slot:
+    st.header("At a glance")
+    if summary_url:
+        st.markdown(
+            f'<a href="{summary_url}" target="_blank" rel="noopener" title="Open full size in a new tab">'
+            f'<img src="{summary_url}" alt="AiEDU learning summary" '
+            'style="width:100%;border:1px solid #DDE3EA;border-radius:8px"></a>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Click the image to open it full size in a new tab. Details follow below.")
+    else:
+        st.image(summary_png, width="stretch")
+        st.caption("Hover over the image and use the expand icon to view it full size. Details follow below.")
+    st.download_button(
+        "Download summary image (PNG)",
+        data=summary_png,
+        file_name="aiedu_summary.png",
+        mime="image/png",
+    )
+    st.divider()
 st.subheader("Automated teaching feedback")
 for message in feedback:
     st.write(f"- {message}")
