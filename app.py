@@ -85,32 +85,72 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("Unsupported file type. Upload CSV, XLSX, or XLS.")
 
 
-def to_csv_url(url: str) -> str:
-    """Turn a Google Sheets link into a CSV download link.
+class SheetLoadError(Exception):
+    """Raised with a message that can be shown to the user as is."""
 
-    Accepts a "Publish to web" CSV link as is. A normal sheet link
-    (.../spreadsheets/d/<id>/edit#gid=<gid>) is converted to its CSV export,
-    which works when the sheet is shared as "Anyone with the link can view".
+
+def csv_url_candidates(url: str) -> List[str]:
+    """Turn a Google Sheets link into CSV download links to try, best first.
+
+    - A "Publish to web" CSV link is used as is.
+    - A normal sheet link (.../spreadsheets/d/<id>/edit...) is converted to its CSV
+      export. If the link names a tab (gid=...), that tab is used; otherwise the
+      first tab is used. Form-response sheets often have a tab id other than 0,
+      so no tab id is guessed.
     """
     url = url.strip()
-    if "output=csv" in url or "format=csv" in url:
-        return url
+    if "output=csv" in url or "format=csv" in url or "tqx=out:csv" in url:
+        return [url]
+    if "/pubhtml" in url:
+        return [url.replace("/pubhtml", "/pub").split("#")[0] + ("&" if "?" in url else "?") + "output=csv"]
     match = re.search(r"docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)", url)
     if match and "/d/e/" not in url:
+        base = f"https://docs.google.com/spreadsheets/d/{match.group(1)}"
         gid_match = re.search(r"[#&?]gid=(\d+)", url)
-        gid = gid_match.group(1) if gid_match else "0"
-        return (
-            f"https://docs.google.com/spreadsheets/d/{match.group(1)}"
-            f"/export?format=csv&gid={gid}"
-        )
-    if "/pubhtml" in url:
-        return url.replace("/pubhtml", "/pub") + ("&" if "?" in url else "?") + "output=csv"
-    return url
+        if gid_match:
+            gid = gid_match.group(1)
+            return [
+                f"{base}/export?format=csv&gid={gid}",
+                f"{base}/gviz/tq?tqx=out:csv&gid={gid}",
+            ]
+        return [f"{base}/export?format=csv", f"{base}/gviz/tq?tqx=out:csv"]
+    return [url]
 
 
 @st.cache_data(ttl=60, show_spinner="Loading the latest responses…")
-def read_csv_url(url: str) -> pd.DataFrame:
-    return pd.read_csv(url)
+def read_sheet(url: str) -> pd.DataFrame:
+    """Download a Google Sheet as CSV, trying each candidate link in turn."""
+    import urllib.error
+    import urllib.request
+
+    problems = []
+    for candidate in csv_url_candidates(url):
+        request = urllib.request.Request(candidate, headers={"User-Agent": "Mozilla/5.0 AiEDU"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                content_type = response.headers.get("Content-Type", "")
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            problems.append(f"HTTP {exc.code}")
+            continue
+        except urllib.error.URLError as exc:
+            raise SheetLoadError(f"Google Sheets could not be reached ({exc.reason}). Check the internet connection.")
+        if "text/html" in content_type or body.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+            # Google answers with a sign-in page when the sheet is private.
+            problems.append("sign-in page")
+            continue
+        return pd.read_csv(io.BytesIO(body))
+
+    if "sign-in page" in problems:
+        raise SheetLoadError(
+            "The sheet is private. In Google Sheets choose Share → General access → "
+            "'Anyone with the link' → Viewer, then press Refresh data."
+        )
+    raise SheetLoadError(
+        "Google Sheets refused the link (" + ", ".join(problems) + "). Open the sheet, click the "
+        "tab with the form responses, copy the address from the browser bar (it ends in gid=…) "
+        "and paste that here instead."
+    )
 
 
 def split_by_round(
@@ -382,7 +422,7 @@ else:
         link_col1, link_col2 = st.columns([1, 3])
         with link_col1:
             if st.button("Refresh data"):
-                read_csv_url.clear()
+                read_sheet.clear()
         with link_col2:
             st.caption("Data refreshes automatically every minute, or when you press Refresh.")
         if not sheet_url.strip():
@@ -392,12 +432,12 @@ else:
             )
             st.stop()
         try:
-            combined_df = read_csv_url(to_csv_url(sheet_url))
+            combined_df = read_sheet(sheet_url)
+        except SheetLoadError as exc:
+            st.error(str(exc))
+            st.stop()
         except Exception as exc:
-            st.error(
-                "The sheet could not be loaded. Check that it is shared as "
-                f"'Anyone with the link can view' (details: {exc})."
-            )
+            st.error(f"The sheet was downloaded but could not be read as a table ({exc}).")
             st.stop()
 
     if combined_df.empty:
